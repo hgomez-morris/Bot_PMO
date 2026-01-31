@@ -1,0 +1,255 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Project Pulse Bot - PMO Automation MVP
+
+# ============================================
+# PARAMETERS
+# ============================================
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+    Description: Environment name
+
+  SlackBotToken:
+    Type: String
+    NoEcho: true
+    Description: Slack Bot User OAuth Token (xoxb-...)
+
+  SlackSigningSecret:
+    Type: String
+    NoEcho: true
+    Description: Slack Signing Secret
+
+  SlackChannelPMO:
+    Type: String
+    Description: Slack Channel ID for PMO alerts (C0XXXXXXXXX)
+
+  AsanaPAT:
+    Type: String
+    NoEcho: true
+    Description: Asana Personal Access Token
+
+  GroqApiKey:
+    Type: String
+    NoEcho: true
+    Default: ''
+    Description: Groq API Key for AI agent (optional)
+
+# ============================================
+# GLOBALS
+# ============================================
+Globals:
+  Function:
+    Runtime: nodejs20.x
+    MemorySize: 512
+    Timeout: 30
+    Environment:
+      Variables:
+        ENVIRONMENT: !Ref Environment
+        USERS_TABLE: !Ref UsersTable
+        UPDATES_TABLE: !Ref UpdatesTable
+        CONVERSATIONS_TABLE: !Ref ConversationsTable
+        SLACK_BOT_TOKEN: !Ref SlackBotToken
+        SLACK_SIGNING_SECRET: !Ref SlackSigningSecret
+        SLACK_CHANNEL_PMO: !Ref SlackChannelPMO
+        ASANA_PAT: !Ref AsanaPAT
+        GROQ_API_KEY: !Ref GroqApiKey
+
+# ============================================
+# RESOURCES
+# ============================================
+Resources:
+
+  # ----------------------------------------
+  # DynamoDB Tables
+  # ----------------------------------------
+  UsersTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub pmo-bot-users-${Environment}
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: pk
+          AttributeType: S
+      KeySchema:
+        - AttributeName: pk
+          KeyType: HASH
+      Tags:
+        - Key: Project
+          Value: PulseBot
+        - Key: Environment
+          Value: !Ref Environment
+
+  UpdatesTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub pmo-bot-updates-${Environment}
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: pk
+          AttributeType: S
+        - AttributeName: sk
+          AttributeType: S
+      KeySchema:
+        - AttributeName: pk
+          KeyType: HASH
+        - AttributeName: sk
+          KeyType: RANGE
+      Tags:
+        - Key: Project
+          Value: PulseBot
+        - Key: Environment
+          Value: !Ref Environment
+
+  ConversationsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub pmo-bot-conversations-${Environment}
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: pk
+          AttributeType: S
+      KeySchema:
+        - AttributeName: pk
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: expiresAt
+        Enabled: true
+      Tags:
+        - Key: Project
+          Value: PulseBot
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ----------------------------------------
+  # Lambda Functions
+  # ----------------------------------------
+  SlackEventsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub pulse-bot-slack-events-${Environment}
+      Handler: src/handlers/slack-events.handler
+      CodeUri: ../
+      Timeout: 30
+      Description: Handles Slack events and interactions
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref UsersTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref UpdatesTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ConversationsTable
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - bedrock:InvokeModel
+              Resource: 'arn:aws:bedrock:*::foundation-model/anthropic.claude-3-haiku-20240307-v1:0'
+      Events:
+        SlackEvents:
+          Type: HttpApi
+          Properties:
+            Path: /slack/events
+            Method: POST
+            ApiId: !Ref HttpApi
+
+  ScheduledPulseFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub pulse-bot-scheduled-pulse-${Environment}
+      Handler: src/handlers/scheduled-pulse.handler
+      CodeUri: ../
+      Timeout: 300
+      MemorySize: 1024
+      Description: Sends update requests to PMs on schedule
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref UsersTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref UpdatesTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ConversationsTable
+      Events:
+        MondaySchedule:
+          Type: Schedule
+          Properties:
+            Schedule: cron(0 13 ? * MON *)
+            Description: Monday 9am Chile time (UTC-4)
+            Enabled: true
+        ThursdaySchedule:
+          Type: Schedule
+          Properties:
+            Schedule: cron(0 13 ? * THU *)
+            Description: Thursday 9am Chile time (UTC-4)
+            Enabled: true
+
+  # ----------------------------------------
+  # HTTP API (API Gateway v2)
+  # ----------------------------------------
+  HttpApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      StageName: !Ref Environment
+      Description: API for Pulse Bot Slack integration
+      CorsConfiguration:
+        AllowOrigins:
+          - '*'
+        AllowMethods:
+          - POST
+          - GET
+        AllowHeaders:
+          - '*'
+
+  # ----------------------------------------
+  # CloudWatch Log Groups
+  # ----------------------------------------
+  SlackEventsLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/pulse-bot-slack-events-${Environment}
+      RetentionInDays: 30
+
+  ScheduledPulseLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/pulse-bot-scheduled-pulse-${Environment}
+      RetentionInDays: 30
+
+# ============================================
+# OUTPUTS
+# ============================================
+Outputs:
+  ApiEndpoint:
+    Description: API Gateway endpoint URL
+    Value: !Sub https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}
+    Export:
+      Name: !Sub ${AWS::StackName}-ApiEndpoint
+
+  SlackEventsUrl:
+    Description: URL for Slack Event Subscriptions
+    Value: !Sub https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}/slack/events
+
+  SlackEventsFunctionArn:
+    Description: Slack Events Lambda ARN
+    Value: !GetAtt SlackEventsFunction.Arn
+
+  ScheduledPulseFunctionArn:
+    Description: Scheduled Pulse Lambda ARN
+    Value: !GetAtt ScheduledPulseFunction.Arn
+
+  UsersTableName:
+    Description: DynamoDB Users Table Name
+    Value: !Ref UsersTable
+
+  UpdatesTableName:
+    Description: DynamoDB Updates Table Name
+    Value: !Ref UpdatesTable
+
+  ConversationsTableName:
+    Description: DynamoDB Conversations Table Name
+    Value: !Ref ConversationsTable

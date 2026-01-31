@@ -1,0 +1,47 @@
+{
+  "name": "pulse-bot-mvp",
+  "version": "1.0.0",
+  "description": "Project Pulse Bot - PMO Automation via Slack",
+  "main": "src/index.js",
+  "scripts": {
+    "test": "jest",
+    "test:unit": "jest tests/unit",
+    "test:integration": "jest tests/integration",
+    "simulate": "node scripts/simulate-flow.js",
+    "monitor": "node scripts/monitor-pilot.js",
+    "monitor:watch": "node scripts/monitor-pilot.js --watch",
+    "feedback": "node scripts/send-feedback-request.js",
+    "report": "node scripts/generate-pilot-report.js",
+    "verify": "node scripts/verify-deploy.js",
+    "dev": "sam local start-api",
+    "build": "sam build --template infrastructure/template.yaml",
+    "deploy:dev": "cd infrastructure && sam deploy --config-env dev",
+    "deploy:prod": "cd infrastructure && sam deploy --config-env prod"
+  },
+  "keywords": [
+    "slack",
+    "bot",
+    "pmo",
+    "asana",
+    "aws",
+    "lambda"
+  ],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@aws-sdk/client-dynamodb": "^3.500.0",
+    "@aws-sdk/lib-dynamodb": "^3.500.0",
+    "@slack/web-api": "^7.0.0",
+    "asana": "^3.0.0",
+    "dotenv": "^16.6.1",
+    "luxon": "^3.4.0"
+  },
+  "devDependencies": {
+    "@types/jest": "^29.5.0",
+    "aws-sdk-client-mock": "^3.0.0",
+    "jest": "^29.7.0"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}
