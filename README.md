@@ -23,10 +23,11 @@ pulse-bot-mvp/
 ├── src/
 │   ├── handlers/           # Lambda handlers
 │   │   ├── slack-events.js # Maneja eventos de Slack (mensajes, botones)
-│   │   └── scheduled-pulse.js # Cron job para solicitar updates
+│   │   ├── scheduled-pulse.js # Cron job para solicitar updates
+│   │   └── cache-refresh.js # Refresca cache de proyectos cada hora
 │   ├── services/           # Clientes de APIs externas
 │   │   ├── slack.js        # Slack Web API
-│   │   ├── asana.js        # Asana API v3.x
+│   │   ├── asana.js        # Asana API v3.x (con búsqueda paralela)
 │   │   ├── dynamo.js       # DynamoDB operations
 │   │   └── agent.js        # Groq AI agent
 │   └── lib/                # Lógica de negocio
@@ -39,7 +40,7 @@ pulse-bot-mvp/
 │   ├── deploy.sh           # Script de despliegue
 │   ├── test-asana.js       # Test conexión Asana
 │   ├── find-responsables.js # Lista responsables en Asana
-│   ├── search-harold.js    # Busca proyectos por responsable
+│   ├── refresh-all-caches.js # Refresh manual de todos los caches
 │   └── cache-user-projects.js # Cachea proyectos de un usuario
 ├── package.json
 ├── samconfig.toml          # Configuración SAM CLI
@@ -130,60 +131,52 @@ El bot busca proyectos usando estos campos custom en Asana:
 
 ---
 
-## IMPORTANTE: Sistema de Cache de Proyectos
+## Sistema de Cache de Proyectos
 
 ### Por qué existe el cache
 
 Asana NO permite filtrar proyectos por custom fields. Para encontrar los proyectos de un usuario, hay que:
-1. Listar TODOS los proyectos del workspace (~1400 proyectos)
+1. Listar TODOS los proyectos del workspace
 2. Obtener los custom_fields de CADA proyecto (1 API call por proyecto)
 3. Filtrar por "Responsable Proyecto"
 
-**Esto toma ~19 minutos** y excede el timeout de Lambda (30s) y API Gateway (29s).
-
 ### Cómo funciona el cache
 
-1. Los proyectos de cada usuario se guardan en DynamoDB (`cachedProjects`)
-2. El comando "mis proyectos" lee del cache, NO de Asana
-3. El cache tiene validez de 24 horas
+1. **Lambda `cache-refresh`** se ejecuta automáticamente cada hora (EventBridge)
+2. Busca proyectos **activos** (excluye archivados y Status="completed")
+3. Usa **requests paralelas** (20 simultáneas) para velocidad
+4. Guarda en DynamoDB el cache de cada usuario onboarded
+5. El comando "mis proyectos" lee del cache, NO de Asana
+6. Cache válido por 24 horas (pero se refresca cada hora)
 
-### Cómo actualizar el cache manualmente
+### Optimizaciones implementadas
+
+| Optimización | Impacto |
+|--------------|---------|
+| Solo proyectos activos | ~1400 → ~300 proyectos |
+| Requests paralelas (x20) | ~19 min → ~30-60 seg |
+
+### Custom Fields utilizados
+
+- **"Responsable Proyecto"**: Para asignar proyectos a usuarios
+- **"Status"**: Para filtrar (valores: On track, Off track, On hold, At risk, **Completed**)
+- **"PMO ID"**: Para búsqueda directa (no usa cache)
+
+### Administración manual del cache
 
 ```bash
-# Primero, obtener el Slack User ID del usuario
+# Ver usuarios y su cache
 aws dynamodb scan --table-name pmo-bot-users-dev --region us-east-1
 
-# Luego, ejecutar el script (usa los proyectos hardcodeados de Harold)
-node scripts/cache-user-projects.js U099D8C69RS
+# Forzar refresh de todos los usuarios
+node scripts/refresh-all-caches.js
 
-# O buscar proyectos de Asana y cachearlos (TOMA ~19 MINUTOS)
-node scripts/search-harold.js  # Busca todos los proyectos con "harold"
-```
+# Cache manual para un usuario específico
+node scripts/cache-user-projects.js <slackUserId>
 
-### Cómo encontrar proyectos de un nuevo usuario
-
-```bash
-# 1. Listar todos los responsables únicos (muestra primeros 200 proyectos)
-node scripts/find-responsables.js
-
-# 2. Buscar proyectos de un responsable específico (LENTO - ~19 min)
+# Buscar proyectos de un responsable (debug)
 node scripts/test-asana.js "Nombre Apellido"
-
-# 3. Cachear los proyectos encontrados
-node scripts/cache-user-projects.js <slackUserId> <gid1,gid2,gid3>
 ```
-
-### Limitación actual
-
-**El cache NO se actualiza automáticamente.**
-
-Cuando cambia algo en Asana (nuevo proyecto, cambio de responsable), hay que actualizar el cache manualmente.
-
-### Soluciones futuras (no implementadas)
-
-1. **Webhooks de Asana** - Recibir notificaciones cuando cambian proyectos
-2. **Job nocturno con Step Functions** - Para búsquedas largas sin límite de tiempo
-3. **Refresh en ScheduledPulse** - Agregar lógica al cron de Lunes/Jueves
 
 ---
 
@@ -256,29 +249,40 @@ Después del onboarding, el usuario puede usar comandos.
 
 ### "mis proyectos" no muestra nada
 - Verificar que el usuario tiene cache: `aws dynamodb get-item --table-name pmo-bot-users-dev --key '{"pk":{"S":"USER#<slackUserId>"}}'`
-- Si no hay cache, ejecutar script de cache manual
+- Si no hay cache, esperar al próximo ciclo de cache-refresh (cada hora) o ejecutar manualmente: `node scripts/refresh-all-caches.js`
 
 ### Los botones no funcionan
 - Verificar que Slack Interactivity URL está configurado: `https://<api-id>.execute-api.us-east-1.amazonaws.com/dev/slack/events`
 
-### Lambda timeout
-- La búsqueda de proyectos en Asana toma ~19 minutos
-- Usar cache en lugar de búsqueda en tiempo real
+### Cache no se actualiza
+- Verificar que Lambda `cache-refresh` está ejecutándose: revisar CloudWatch Logs
+- El cache se actualiza cada hora automáticamente
+- Para forzar refresh: `node scripts/refresh-all-caches.js`
 
 ### Asana SDK v3.x
 - Usar `Asana.ApiClient.instance` y clases separadas (UsersApi, ProjectsApi, etc.)
 - Paginación está en `response._response.next_page.offset`
+
+### Ver logs de cache-refresh
+```bash
+MSYS_NO_PATHCONV=1 aws logs describe-log-streams \
+  --log-group-name "/aws/lambda/pulse-bot-cache-refresh-dev" \
+  --region us-east-1 --order-by LastEventTime --descending --limit 1
+```
 
 ---
 
 ## Recursos AWS Desplegados
 
 - **Lambda Functions**:
-  - `pulse-bot-slack-events-dev` (30s timeout)
-  - `pulse-bot-scheduled-pulse-dev` (300s timeout)
+  - `pulse-bot-slack-events-dev` (30s timeout) - Eventos de Slack
+  - `pulse-bot-scheduled-pulse-dev` (300s timeout) - Solicita updates Lun/Jue
+  - `pulse-bot-cache-refresh-dev` (120s timeout) - Refresca cache cada hora
 - **API Gateway**: HTTP API en `/slack/events`
 - **DynamoDB Tables**: users, updates, conversations
-- **EventBridge Rules**: Lunes y Jueves 13:00 UTC (9am Chile)
+- **EventBridge Rules**:
+  - Lunes y Jueves 13:00 UTC (9am Chile) - Scheduled Pulse
+  - Cada hora - Cache Refresh
 - **CloudWatch Log Groups**: Retención 30 días
 
 ---

@@ -10,8 +10,6 @@
 const { DateTime } = require('luxon');
 const dynamoService = require('../services/dynamo');
 const slackService = require('../services/slack');
-const asanaService = require('../services/asana');
-const messages = require('../lib/messages');
 
 /**
  * Handler principal de Lambda
@@ -47,8 +45,13 @@ exports.handler = async (event) => {
           continue;
         }
 
-        // Obtener proyectos del usuario desde Asana
-        const projects = await asanaService.getProjectsForUser(user.asanaEmail);
+        if (!user.asanaName) {
+          console.log(`Usuario ${user.slackUserId} sin asanaName, saltando`);
+          continue;
+        }
+
+        // Obtener proyectos del usuario desde cache global
+        const projects = await dynamoService.getProjectsByResponsableName(user.asanaName);
 
         // Limitar a 5 proyectos en MVP
         const projectsToProcess = projects.slice(0, 5);

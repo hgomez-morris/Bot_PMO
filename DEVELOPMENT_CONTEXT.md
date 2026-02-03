@@ -2,7 +2,7 @@
 
 Este documento contiene el contexto necesario para continuar el desarrollo del bot.
 
-## Estado Actual (2026-01-31)
+## Estado Actual (2026-02-02)
 
 ### Funcionalidades Implementadas
 
@@ -14,6 +14,7 @@ Este documento contiene el contexto necesario para continuar el desarrollo del b
 - [x] Agente de IA con Groq (entiende lenguaje natural)
 - [x] Botones interactivos de Slack
 - [x] Sistema de cache de proyectos en DynamoDB
+- [x] **Cache automático cada hora** (Lambda cache-refresh + EventBridge)
 - [x] Flujo de update request (status, blockers, advances)
 - [x] Detección de riesgos
 - [x] Alertas al canal PMO
@@ -21,132 +22,107 @@ Este documento contiene el contexto necesario para continuar el desarrollo del b
 
 ### Funcionalidades Pendientes
 
-- [ ] **Sincronización automática del cache de proyectos**
-- [ ] Refresh de cache en ScheduledPulse
-- [ ] Webhooks de Asana para actualizaciones en tiempo real
+- [ ] Webhooks de Asana para actualizaciones en tiempo real (opcional, el cache cada hora es suficiente)
 - [ ] Tests unitarios completos
 - [ ] Tests de integración
+- [ ] Dashboard de monitoreo
 
 ---
 
-## Problema Principal: Cache de Proyectos
+## Sistema de Cache de Proyectos
 
-### Contexto
+### Contexto del Problema
 
-Asana tiene ~1400 proyectos. Para encontrar los proyectos de un PM, hay que:
+Asana tiene ~1400 proyectos totales. Para encontrar los proyectos de un PM, hay que:
 1. Listar todos los proyectos (paginado, 14 páginas de 100)
 2. Para cada proyecto, hacer una llamada API para obtener custom_fields
 3. Filtrar por campo "Responsable Proyecto"
 
-**Tiempo total: ~19 minutos** (72 proyectos/minuto)
+**Sin optimización:** ~19 minutos (requests secuenciales)
 
-### Limitaciones
+### Solución Implementada: Cache Automático con Optimizaciones
 
-- Lambda timeout máximo: 15 minutos
-- API Gateway timeout: 29 segundos
-- No hay forma de filtrar por custom fields en Asana API
+#### Optimización 1: Solo Proyectos Activos
 
-### Solución Actual
+Filtrar proyectos que NO deben incluirse en cache:
+- `archived === true` (proyectos archivados)
+- `Status === "completed"` (proyectos completados)
 
-Cache manual en DynamoDB:
-```javascript
-// En dynamo.js
-cacheUserProjects(slackUserId, projects)  // Guarda
-getCachedUserProjects(slackUserId)        // Lee (válido 24h)
+**Resultado real:** 1377 proyectos no archivados → 1285 proyectos activos con responsable
+
+#### Optimización 2: Requests Paralelas
+
+En lugar de requests secuenciales (1 a la vez), hacer 20 requests en paralelo.
+Asana permite 1500 requests/minuto, usamos ~720/min con 20 paralelas.
+
+**Resultado real:** ~19 minutos → **66 segundos** (probado en AWS Lambda)
+
+#### Resultados del Test en AWS (2026-02-02)
+
+```
+Tiempo total: 66 segundos
+Proyectos procesados: 1377
+Proyectos activos con responsable: 1285
+Responsables únicos: 74
+Harold Gomez: 8 proyectos cacheados
+Memoria usada: 126 MB / 512 MB
 ```
 
-### Usuarios con Cache
+#### Arquitectura Final
+
+```
+[EventBridge: cada 1 hora]
+    ↓
+[Lambda: cache-refresh] (timeout 120s)
+    ↓
+[Asana API: requests paralelas]
+    ↓
+[DynamoDB: actualizar cache de cada usuario]
+```
+
+### Cache en DynamoDB
+
+```javascript
+// En dynamo.js
+cacheUserProjects(slackUserId, projects)  // Guarda proyectos
+getCachedUserProjects(slackUserId)        // Lee (válido 24h, con opción allowStale)
+```
+
+### Custom Fields de Asana Utilizados
+
+| Campo | Uso |
+|-------|-----|
+| `Responsable Proyecto` | Identificar PM del proyecto |
+| `Status` | Filtrar completados (valores: On track, Off track, On hold, At risk, Completed) |
+| `PMO ID` | Búsqueda directa por ID (no usa cache) |
+
+### Usuarios Actuales
 
 | Slack ID | Nombre | Proyectos |
 |----------|--------|-----------|
 | U099D8C69RS | Harold Gomez | 8 proyectos |
 
-### Cómo Agregar Nuevo Usuario
+### Agregar Nuevo Usuario
+
+1. Usuario hace onboarding en Slack (automático)
+2. Cache se actualiza en el próximo ciclo de EventBridge (cada hora)
+3. O manualmente: `node scripts/cache-user-projects.js <slackUserId>`
+
+### Scripts de Administración
 
 ```bash
-# 1. Usuario hace onboarding en Slack (obtiene slackUserId)
+# Refresh manual del cache (ejecuta la misma lógica que Lambda)
+node scripts/refresh-all-caches.js
 
-# 2. Buscar sus proyectos (LENTO ~19 min)
+# Buscar proyectos de un responsable específico
 node scripts/test-asana.js "Nombre Apellido"
 
-# 3. Copiar los GIDs encontrados y cachear
-node scripts/cache-user-projects.js <slackUserId> gid1,gid2,gid3
+# Ver responsables únicos en Asana
+node scripts/find-responsables.js
+
+# Cache manual para un usuario específico
+node scripts/cache-user-projects.js <slackUserId> [gid1,gid2,...]
 ```
-
----
-
-## Opciones para Automatizar el Cache
-
-### Opción 1: Step Functions (Recomendada)
-
-AWS Step Functions permite workflows de hasta 1 año.
-
-```
-[EventBridge Trigger]
-    → [Lambda: Get Users]
-    → [Map State: For Each User]
-        → [Lambda: Search Asana Projects] (15 min timeout)
-        → [Lambda: Save to DynamoDB]
-```
-
-Pros:
-- Sin límite de tiempo
-- Reintentos automáticos
-- Monitoreo visual
-
-Cons:
-- Complejidad adicional
-- Costo adicional (mínimo)
-
-### Opción 2: Asana Webhooks
-
-Asana puede notificar cambios via webhooks.
-
-```
-[Asana Project Change] → [API Gateway] → [Lambda: Update Cache]
-```
-
-Pros:
-- Actualizaciones en tiempo real
-- Sin búsqueda completa
-
-Cons:
-- Requiere configuración en Asana
-- Webhook por cada proyecto (complejo)
-
-### Opción 3: EC2 con Cron
-
-Una instancia EC2 pequeña ejecutando el script de cache.
-
-```bash
-# Crontab
-0 3 * * * /usr/bin/node /app/refresh-all-caches.js
-```
-
-Pros:
-- Simple de implementar
-- Sin límite de tiempo
-
-Cons:
-- Costo de EC2 (t3.micro ~$8/mes)
-- Otro recurso que mantener
-
-### Opción 4: Lambda con SQS
-
-Dividir el trabajo en mensajes SQS.
-
-```
-[Trigger] → [Lambda: List Projects] → [SQS: 1400 messages]
-[SQS Consumer Lambda] → Process 1 project → Save if match
-```
-
-Pros:
-- Escalable
-- Sin timeout issues
-
-Cons:
-- Muchas invocaciones Lambda
-- Complejidad
 
 ---
 
@@ -185,6 +161,37 @@ if (cached && cached.projects.length > 0) {
 } else {
   // Informar que no hay cache
 }
+```
+
+### src/handlers/cache-refresh.js
+
+```javascript
+// Lambda que se ejecuta cada hora via EventBridge
+// 1. Obtiene todos los usuarios onboarded
+// 2. Busca TODOS los proyectos activos de Asana (paralelo)
+// 3. Agrupa por responsable
+// 4. Actualiza cache de cada usuario en DynamoDB
+
+exports.handler = async (event) => {
+  const users = await dynamoService.getAllOnboardedUsers();
+  const allProjects = await asanaService.getAllActiveProjectsWithResponsable();
+  const projectsByResponsable = asanaService.groupProjectsByResponsable(allProjects);
+
+  for (const user of users) {
+    const userProjects = projectsByResponsable.get(normalizedName);
+    await dynamoService.cacheUserProjects(user.slackUserId, userProjects);
+  }
+};
+```
+
+### src/services/asana.js - Funciones Nuevas
+
+```javascript
+// Búsqueda paralela optimizada (20 requests simultáneas)
+async function getAllActiveProjectsWithResponsable()
+
+// Agrupa proyectos por responsable normalizado
+function groupProjectsByResponsable(projects)
 ```
 
 ---
@@ -252,11 +259,31 @@ Proyectos cacheados:
 
 ## Próximos Pasos Sugeridos
 
-1. **Implementar refresh automático del cache** (elegir una de las 4 opciones)
-2. Agregar más usuarios al sistema con sus caches
-3. Probar el flujo completo de update request
+1. ~~Implementar refresh automático del cache~~ ✅ Implementado y probado (66s en AWS)
+2. Agregar más usuarios al sistema (onboarding automático + cache cada hora)
+3. Probar el flujo completo de update request (botones de status)
 4. Probar las alertas al canal PMO
-5. Implementar tests
+5. Implementar tests unitarios
+6. Monitorear tiempos de ejecución en CloudWatch Dashboard
+
+## Comandos para Monitoreo
+
+```bash
+# Ver últimas ejecuciones de cache-refresh
+MSYS_NO_PATHCONV=1 aws logs filter-log-events \
+  --log-group-name "/aws/lambda/pulse-bot-cache-refresh-dev" \
+  --filter-pattern "Completado" \
+  --region us-east-1
+
+# Invocar cache-refresh manualmente (no espera respuesta)
+aws lambda invoke --function-name pulse-bot-cache-refresh-dev \
+  --invocation-type Event \
+  --region us-east-1 /dev/null
+
+# Ver estado del EventBridge rule
+aws events describe-rule --name pulse-bot-cache-refresh-dev-HourlyRefresh \
+  --region us-east-1
+```
 
 ---
 
@@ -286,6 +313,18 @@ Esta URL maneja:
 
 ### Rate Limiting
 
-- Asana: 1500 requests/minute (usamos ~72/min)
+- Asana: 1500 requests/minute (usamos ~720/min con paralelas)
 - Slack: 1 message/second
 - Groq: Free tier limits apply
+
+### Métricas de Performance (cache-refresh)
+
+| Métrica | Valor |
+|---------|-------|
+| Tiempo de ejecución | ~66 segundos |
+| Proyectos procesados | 1377 |
+| Proyectos con responsable | 1285 |
+| Responsables únicos | 74 |
+| Memoria usada | 126 MB |
+| Lambda timeout | 120 segundos |
+| Frecuencia | Cada 1 hora |

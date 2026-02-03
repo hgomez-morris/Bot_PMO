@@ -54,6 +54,7 @@ Globals:
         USERS_TABLE: !Ref UsersTable
         UPDATES_TABLE: !Ref UpdatesTable
         CONVERSATIONS_TABLE: !Ref ConversationsTable
+        PROJECTS_TABLE: !Ref ProjectsTable
         SLACK_BOT_TOKEN: !Ref SlackBotToken
         SLACK_SIGNING_SECRET: !Ref SlackSigningSecret
         SLACK_CHANNEL_PMO: !Ref SlackChannelPMO
@@ -126,6 +127,44 @@ Resources:
         - Key: Environment
           Value: !Ref Environment
 
+  ProjectsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub pmo-bot-projects-${Environment}
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: pk
+          AttributeType: S
+        - AttributeName: sk
+          AttributeType: S
+        - AttributeName: responsableKey
+          AttributeType: S
+        - AttributeName: pmoId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: pk
+          KeyType: HASH
+        - AttributeName: sk
+          KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: ResponsableIndex
+          KeySchema:
+            - AttributeName: responsableKey
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+        - IndexName: PmoIdIndex
+          KeySchema:
+            - AttributeName: pmoId
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+      Tags:
+        - Key: Project
+          Value: PulseBot
+        - Key: Environment
+          Value: !Ref Environment
+
   # ----------------------------------------
   # Lambda Functions
   # ----------------------------------------
@@ -144,6 +183,8 @@ Resources:
             TableName: !Ref UpdatesTable
         - DynamoDBCrudPolicy:
             TableName: !Ref ConversationsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ProjectsTable
         - Version: '2012-10-17'
           Statement:
             - Effect: Allow
@@ -174,6 +215,8 @@ Resources:
             TableName: !Ref UpdatesTable
         - DynamoDBCrudPolicy:
             TableName: !Ref ConversationsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ProjectsTable
       Events:
         MondaySchedule:
           Type: Schedule
@@ -186,6 +229,26 @@ Resources:
           Properties:
             Schedule: cron(0 13 ? * THU *)
             Description: Thursday 9am Chile time (UTC-4)
+            Enabled: true
+
+  CacheRefreshFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub pulse-bot-cache-refresh-${Environment}
+      Handler: src/handlers/cache-refresh.handler
+      CodeUri: ../
+      Timeout: 300
+      MemorySize: 1024
+      Description: Refreshes global projects cache
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ProjectsTable
+      Events:
+        SixHourRefresh:
+          Type: Schedule
+          Properties:
+            Schedule: rate(6 hours)
+            Description: Refresh projects cache every 6 hours
             Enabled: true
 
   # ----------------------------------------
@@ -220,6 +283,12 @@ Resources:
       LogGroupName: !Sub /aws/lambda/pulse-bot-scheduled-pulse-${Environment}
       RetentionInDays: 30
 
+  CacheRefreshLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/pulse-bot-cache-refresh-${Environment}
+      RetentionInDays: 30
+
 # ============================================
 # OUTPUTS
 # ============================================
@@ -242,6 +311,10 @@ Outputs:
     Description: Scheduled Pulse Lambda ARN
     Value: !GetAtt ScheduledPulseFunction.Arn
 
+  CacheRefreshFunctionArn:
+    Description: Cache Refresh Lambda ARN
+    Value: !GetAtt CacheRefreshFunction.Arn
+
   UsersTableName:
     Description: DynamoDB Users Table Name
     Value: !Ref UsersTable
@@ -253,3 +326,7 @@ Outputs:
   ConversationsTableName:
     Description: DynamoDB Conversations Table Name
     Value: !Ref ConversationsTable
+
+  ProjectsTableName:
+    Description: DynamoDB Projects Table Name
+    Value: !Ref ProjectsTable

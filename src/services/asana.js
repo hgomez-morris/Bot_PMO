@@ -359,11 +359,178 @@ async function getProjectByPmoId(pmoId) {
   }
 }
 
+/**
+ * Obtiene todos los proyectos no archivados con responsable/estado/PMO ID
+ * Usado por cache-refresh para actualizar el cache global
+ *
+ * @returns {Array<{gid: string, name: string, responsable: string|null, status: string|null, pmoId: string|null}>}
+ */
+async function getAllActiveProjectsWithResponsable() {
+  try {
+    initClient();
+    console.log('[Asana] Iniciando busqueda paralela de proyectos no archivados...');
+
+    const workspacesResponse = await workspacesApi.getWorkspaces({});
+    const workspacesList = workspacesResponse.data || [];
+
+    const allProjects = [];
+
+    for (const workspace of workspacesList) {
+      // Paso 1: Obtener lista de todos los proyectos (solo metadata basica)
+      const projectList = [];
+      let offset = null;
+      let pageCount = 0;
+
+      do {
+        const params = { limit: 100, opt_fields: 'name,archived' };
+        if (offset) params.offset = offset;
+
+        const response = await getProjectsPageWithRetry(workspace.gid, params, 3);
+        const projects = response.data || [];
+        pageCount++;
+
+        // Filtrar archivados inmediatamente
+        const activeProjects = projects.filter(p => !p.archived);
+        projectList.push(...activeProjects);
+
+        console.log(`[Asana] Pagina ${pageCount}: ${projects.length} proyectos (${activeProjects.length} activos)`);
+
+        offset = response._response?.next_page?.offset || null;
+        await sleep(50);
+      } while (offset);
+
+      console.log(`[Asana] Total proyectos no archivados: ${projectList.length}`);
+
+      // Paso 2: Obtener custom_fields en paralelo (batches moderados para evitar rate limit)
+      const BATCH_SIZE = 10;
+      let processed = 0;
+
+      for (let i = 0; i < projectList.length; i += BATCH_SIZE) {
+        const batch = projectList.slice(i, i + BATCH_SIZE);
+
+        const results = await Promise.all(
+          batch.map(async (project) => {
+            try {
+              const detail = await getProjectDetailWithRetry(project.gid, 3);
+
+              const customFields = detail.data?.custom_fields || [];
+
+              const statusField = customFields.find(
+                cf => cf.name && cf.name.toLowerCase() === 'status'
+              );
+              const status = statusField?.display_value || null;
+
+              const responsableField = customFields.find(
+                cf => cf.name === 'Responsable Proyecto'
+              );
+              const responsable = responsableField?.display_value || null;
+
+              const pmoIdField = customFields.find(
+                cf => cf.name && cf.name.toLowerCase().includes('pmo id')
+              );
+              const pmoId = pmoIdField?.display_value || null;
+
+              return {
+                gid: project.gid,
+                name: project.name,
+                responsable,
+                status,
+                pmoId
+              };
+            } catch (err) {
+              // Ignorar errores individuales (403, etc.)
+              return null;
+            }
+          })
+        );
+
+        // Agregar resultados validos
+        const validResults = results.filter(r => r !== null);
+        allProjects.push(...validResults);
+
+        processed += batch.length;
+        console.log(`[Asana] Procesados: ${processed}/${projectList.length} (${validResults.length} con detalle en este batch)`);
+
+        // Pausa entre batches para no saturar Asana
+        await sleep(500);
+      }
+    }
+
+    console.log(`[Asana] Busqueda completada: ${allProjects.length} proyectos no archivados`);
+    return allProjects;
+
+  } catch (error) {
+    console.error('[Asana] Error en busqueda paralela:', error);
+    throw error;
+  }
+}
+
+async function getProjectDetailWithRetry(projectGid, retries = 3) {
+  let attempt = 0;
+  while (true) {
+    try {
+      return await projectsApi.getProject(projectGid, {
+        opt_fields: 'custom_fields,custom_fields.name,custom_fields.display_value'
+      });
+    } catch (error) {
+      const status = error?.status || error?.response?.status;
+      const retryAfter = Number(error?.response?.headers?.['retry-after'] || 0);
+      if (status === 429 && attempt < retries) {
+        const delayMs = retryAfter > 0 ? retryAfter * 1000 : 1000 * Math.pow(2, attempt);
+        await sleep(delayMs);
+        attempt += 1;
+        continue;
+      }
+      throw error;
+    }
+  }
+}
+
+async function getProjectsPageWithRetry(workspaceGid, params, retries = 3) {
+  let attempt = 0;
+  while (true) {
+    try {
+      return await projectsApi.getProjectsForWorkspace(workspaceGid, params);
+    } catch (error) {
+      const status = error?.status || error?.response?.status;
+      const retryAfter = Number(error?.response?.headers?.['retry-after'] || 0);
+      if (status === 429 && attempt < retries) {
+        const delayMs = retryAfter > 0 ? retryAfter * 1000 : 1000 * Math.pow(2, attempt);
+        await sleep(delayMs);
+        attempt += 1;
+        continue;
+      }
+      throw error;
+    }
+  }
+}
+
+function groupProjectsByResponsable(projects) {
+  const grouped = new Map();
+
+  for (const project of projects) {
+    if (!project.responsable) continue;
+    const responsable = project.responsable.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+
+    if (!grouped.has(responsable)) {
+      grouped.set(responsable, []);
+    }
+    grouped.get(responsable).push({
+      gid: project.gid,
+      name: project.name
+    });
+  }
+
+  return grouped;
+}
+
 module.exports = {
   getProjectsForUser,
   getProjectDetails,
   getProjectByPmoId,
   getUserByEmail,
   verifyAccess,
-  getProjectMilestones
+  getProjectMilestones,
+  getAllActiveProjectsWithResponsable,
+  groupProjectsByResponsable
 };

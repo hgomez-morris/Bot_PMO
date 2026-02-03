@@ -11,7 +11,6 @@
 
 const slackService = require('../services/slack');
 const dynamoService = require('../services/dynamo');
-const asanaService = require('../services/asana');
 const agentService = require('../services/agent');
 const messages = require('../lib/messages');
 const riskDetector = require('../lib/risk-detector');
@@ -28,6 +27,14 @@ exports.handler = async (event) => {
     let rawBody = event.body;
     if (event.isBase64Encoded) {
       rawBody = Buffer.from(event.body, 'base64').toString('utf-8');
+    }
+
+    // Slack reintenta si no respondemos rapido. Evitar duplicados.
+    const retryNum = event.headers?.['x-slack-retry-num'] || event.headers?.['X-Slack-Retry-Num'];
+    const retryReason = event.headers?.['x-slack-retry-reason'] || event.headers?.['X-Slack-Retry-Reason'];
+    if (retryNum || retryReason) {
+      console.warn(`Slack retry recibido (num=${retryNum || 'n/a'} reason=${retryReason || 'n/a'}). Ignorando.`);
+      return { statusCode: 200, body: 'OK' };
     }
 
     // 2. Parsear body según content-type
@@ -164,19 +171,22 @@ async function handleAdvancesText(userId, text) {
   if (textLower === 'mis proyectos' || textLower === 'proyectos') {
     const user = await dynamoService.getUser(userId);
     if (user?.asanaName) {
-      // Usar cache (la búsqueda en tiempo real toma ~19 min y excede timeout de Lambda)
-      const cached = await dynamoService.getCachedUserProjects(userId);
-      if (cached && cached.projects.length > 0) {
-        const projectList = cached.projects.map(p => `• ${p.name}`).join('\n');
-        const cacheDate = new Date(cached.cachedAt).toLocaleDateString('es-CL');
-        await slackService.sendMessage(userId, `*Tus proyectos (${cached.projects.length}):*\n${projectList}\n\n_Última sincronización: ${cacheDate}_`);
+      const projects = await dynamoService.getProjectsByResponsableName(user.asanaName);
+      if (projects.length > 0) {
+        const projectList = projects.map(p => `- ${p.name}`).join('\n');
+        await slackService.sendMessage(
+          userId,
+          `*Tus proyectos (${projects.length}):*
+${projectList}`
+        );
       } else {
-        // Sin cache - informar al usuario
-        await slackService.sendMessage(userId,
-          `Aún no he sincronizado tus proyectos.\n\n` +
-          `Tu nombre en Asana: *${user.asanaName}*\n\n` +
-          `Los proyectos se sincronizan automáticamente cada día. ` +
-          `Si necesitas verlos ahora, escribe *sincronizar* para iniciar una búsqueda manual.`
+        await slackService.sendMessage(
+          userId,
+          `Aun no tengo proyectos cacheados para tu perfil.
+` +
+          `Tu nombre en Asana: *${user.asanaName}*.
+` +
+          `El cache global se actualiza cada 6 horas.`
         );
       }
     } else {
@@ -187,22 +197,31 @@ async function handleAdvancesText(userId, text) {
 
 
   // Buscar proyecto por PMO ID (ej: PMO-911)
-  const pmoIdMatch = text.match(/^pmo-?\d+$/i);
+  const pmoIdMatch = text.match(/pmo-?\d+/i);
   if (pmoIdMatch) {
-    const pmoId = text.toUpperCase().replace('PMO', 'PMO-').replace('PMO--', 'PMO-');
+    const rawPmoId = pmoIdMatch[0];
+    const pmoId = rawPmoId.toUpperCase().replace('PMO', 'PMO-').replace('PMO--', 'PMO-');
     await slackService.sendMessage(userId, `Buscando proyecto ${pmoId}...`);
 
-    const project = await asanaService.getProjectByPmoId(pmoId);
-    if (project) {
-      const info = [
-        `*${project.name}*`,
-        `• *PMO ID:* ${project.pmoId}`,
-        `• *Responsable:* ${project.responsable}`,
-        `• *Estado:* ${project.status || 'Sin estado'}`
-      ].join('\n');
-      await slackService.sendMessage(userId, info);
-    } else {
-      await slackService.sendMessage(userId, `No encontré ningún proyecto con ID ${pmoId}`);
+    try {
+      const project = await dynamoService.getProjectByPmoIdCached(pmoId);
+      if (project) {
+        const info = [
+          `*${project.name}*`,
+          `- PMO ID: ${project.pmoId || pmoId}`,
+          `- Responsable: ${project.responsable || 'No asignado'}`,
+          `- Estado: ${project.status || 'Sin estado'}`
+        ].join('\n');
+        await slackService.sendMessage(userId, info);
+      } else {
+        await slackService.sendMessage(userId, `No encontre ningun proyecto con ID ${pmoId}`);
+      }
+    } catch (error) {
+      console.error(`Error buscando proyecto ${pmoId}:`, error);
+      await slackService.sendMessage(
+        userId,
+        `Hubo un problema buscando el proyecto ${pmoId}. Intenta de nuevo en unos minutos.`
+      );
     }
     return;
   }
@@ -268,29 +287,32 @@ async function handleWithAgent(userId, text) {
       switch (result.tool) {
         case 'buscar_proyecto':
           const pmoId = result.params.pmo_id;
-          const project = await asanaService.getProjectByPmoId(pmoId);
+          const project = await dynamoService.getProjectByPmoIdCached(pmoId);
           if (project) {
             const info = [
               `*${project.name}*`,
-              `• *PMO ID:* ${project.pmoId}`,
-              `• *Responsable:* ${project.responsable}`,
-              `• *Estado:* ${project.status || 'Sin estado'}`
+              `- PMO ID: ${project.pmoId || pmoId}`,
+              `- Responsable: ${project.responsable || 'No asignado'}`,
+              `- Estado: ${project.status || 'Sin estado'}`
             ].join('\n');
             await slackService.sendMessage(userId, info);
           } else {
-            await slackService.sendMessage(userId, `No encontré ningún proyecto con ID ${pmoId}`);
+            await slackService.sendMessage(userId, `No encontre ningun proyecto con ID ${pmoId}`);
           }
           break;
 
         case 'mis_proyectos':
           if (user?.asanaName) {
-            // Usar cache (búsqueda en tiempo real excede timeout de Lambda)
-            const cachedProjects = await dynamoService.getCachedUserProjects(userId);
-            if (cachedProjects && cachedProjects.projects.length > 0) {
-              const projectList = cachedProjects.projects.map(p => `• ${p.name}`).join('\n');
-              await slackService.sendMessage(userId, `*Tus proyectos:*\n${projectList}`);
+            const projects = await dynamoService.getProjectsByResponsableName(user.asanaName);
+            if (projects.length > 0) {
+              const projectList = projects.map(p => `- ${p.name}`).join('\n');
+              await slackService.sendMessage(userId, `*Tus proyectos:*
+${projectList}`);
             } else {
-              await slackService.sendMessage(userId, 'Tus proyectos aún no están sincronizados. Los proyectos se sincronizan automáticamente cada día.');
+              await slackService.sendMessage(
+                userId,
+                'Aun no tengo proyectos cacheados para tu perfil. El cache global se actualiza cada 6 horas.'
+              );
             }
           } else {
             await slackService.sendMessage(userId, 'No tienes configurado tu nombre. Escribe "reset" para reconfigurar tu perfil.');

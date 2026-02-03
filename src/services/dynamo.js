@@ -33,6 +33,12 @@ const docClient = DynamoDBDocumentClient.from(client);
 const USERS_TABLE = process.env.USERS_TABLE || 'pmo-bot-users';
 const UPDATES_TABLE = process.env.UPDATES_TABLE || 'pmo-bot-updates';
 const CONVERSATIONS_TABLE = process.env.CONVERSATIONS_TABLE || 'pmo-bot-conversations';
+const PROJECTS_TABLE = process.env.PROJECTS_TABLE || 'pmo-bot-projects';
+
+function normalizeName(text) {
+  if (!text) return '';
+  return text.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+}
 
 /**
  * Obtiene un usuario por su Slack User ID
@@ -301,7 +307,8 @@ async function cacheUserProjects(slackUserId, projects) {
  * @param {string} slackUserId
  * @returns {{projects: Array, cachedAt: string}|null}
  */
-async function getCachedUserProjects(slackUserId) {
+async function getCachedUserProjects(slackUserId, options = {}) {
+  const allowStale = options.allowStale === true;
   try {
     const user = await getUser(slackUserId);
     if (user?.cachedProjects && user?.projectsCachedAt) {
@@ -312,13 +319,117 @@ async function getCachedUserProjects(slackUserId) {
       if (cacheAge < maxAge) {
         return {
           projects: user.cachedProjects,
-          cachedAt: user.projectsCachedAt
+          cachedAt: user.projectsCachedAt,
+          stale: false
+        };
+      }
+      if (allowStale) {
+        return {
+          projects: user.cachedProjects,
+          cachedAt: user.projectsCachedAt,
+          stale: true
         };
       }
     }
     return null;
   } catch (error) {
     console.error('Error obteniendo proyectos cacheados:', error);
+    return null;
+  }
+}
+
+/**
+ * Guarda o actualiza un proyecto en el cache global
+ * @param {Object} project
+ */
+async function upsertProjectCache(project) {
+  const item = {
+    pk: `PROJECT#${project.gid}`,
+    sk: 'META',
+    gid: project.gid,
+    name: project.name,
+    status: project.status || null,
+    responsable: project.responsable || null,
+    responsableKey: project.responsable ? `RESPONSABLE#${normalizeName(project.responsable)}` : null,
+    pmoId: project.pmoId ? project.pmoId.toUpperCase() : null,
+    updatedAt: new Date().toISOString()
+  };
+
+  // Quitar atributos nulos para evitar GSI con strings vacíos
+  Object.keys(item).forEach((key) => {
+    if (item[key] === null) {
+      delete item[key];
+    }
+  });
+
+  try {
+    await docClient.send(new PutCommand({
+      TableName: PROJECTS_TABLE,
+      Item: item
+    }));
+  } catch (error) {
+    console.error('Error guardando proyecto en cache:', error);
+    throw error;
+  }
+}
+
+/**
+ * Elimina un proyecto del cache global
+ * @param {string} projectGid
+ */
+async function deleteProjectCache(projectGid) {
+  try {
+    await docClient.send(new DeleteCommand({
+      TableName: PROJECTS_TABLE,
+      Key: { pk: `PROJECT#${projectGid}`, sk: 'META' }
+    }));
+  } catch (error) {
+    console.error('Error eliminando proyecto del cache:', error);
+    throw error;
+  }
+}
+
+/**
+ * Obtiene proyectos por responsable desde el cache global
+ * @param {string} responsableName
+ * @returns {Array<{gid: string, name: string, pmoId?: string, status?: string}>}
+ */
+async function getProjectsByResponsableName(responsableName) {
+  if (!responsableName) return [];
+  const responsableKey = `RESPONSABLE#${normalizeName(responsableName)}`;
+
+  try {
+    const response = await docClient.send(new QueryCommand({
+      TableName: PROJECTS_TABLE,
+      IndexName: 'ResponsableIndex',
+      KeyConditionExpression: 'responsableKey = :rk',
+      ExpressionAttributeValues: { ':rk': responsableKey }
+    }));
+    return response.Items || [];
+  } catch (error) {
+    console.error('Error obteniendo proyectos por responsable:', error);
+    return [];
+  }
+}
+
+/**
+ * Busca un proyecto por PMO ID desde el cache global
+ * @param {string} pmoId
+ * @returns {Object|null}
+ */
+async function getProjectByPmoIdCached(pmoId) {
+  if (!pmoId) return null;
+  const pmoIdUpper = pmoId.toUpperCase();
+  try {
+    const response = await docClient.send(new QueryCommand({
+      TableName: PROJECTS_TABLE,
+      IndexName: 'PmoIdIndex',
+      KeyConditionExpression: 'pmoId = :pmo',
+      ExpressionAttributeValues: { ':pmo': pmoIdUpper }
+    }));
+    return response.Items?.[0] || null;
+  } catch (error) {
+    console.error('Error buscando proyecto por PMO ID en cache:', error);
     return null;
   }
 }
@@ -336,5 +447,9 @@ module.exports = {
   setConversationState,
   clearConversationState,
   cacheUserProjects,
-  getCachedUserProjects
+  getCachedUserProjects,
+  upsertProjectCache,
+  deleteProjectCache,
+  getProjectsByResponsableName,
+  getProjectByPmoIdCached
 };
