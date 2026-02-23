@@ -420,6 +420,12 @@ async function getAllActiveProjectsWithResponsable() {
               );
               const status = statusField?.display_value || null;
 
+              const progressField = customFields.find(cf => {
+                const name = (cf.name || '').toLowerCase();
+                return name.includes('avance') || name.includes('progress') || name.includes('%');
+              });
+              const progressPercent = progressField?.display_value || null;
+
               const responsableField = customFields.find(
                 cf => cf.name === 'Responsable Proyecto'
               );
@@ -430,12 +436,28 @@ async function getAllActiveProjectsWithResponsable() {
               );
               const pmoId = pmoIdField?.display_value || null;
 
+              const clienteField = customFields.find(
+                cf => cf.name && cf.name.toLowerCase() == 'cliente_nuevo'
+              );
+              const clienteNuevo = clienteField?.display_value || null;
+
+              const currentStatus = detail.data?.current_status || null;
+
               return {
                 gid: project.gid,
                 name: project.name,
                 responsable,
                 status,
-                pmoId
+                pmoId,
+                clienteNuevo,
+                lastUpdateText: currentStatus?.text || null,
+                lastUpdateAt: currentStatus?.created_at || null,
+                progressPercent,
+                dueOn: detail.data?.due_on || null,
+                dueAt: detail.data?.due_at || null,
+                pendingTasks: detail.data?.num_tasks_incomplete ?? null,
+                totalTasks: detail.data?.num_tasks ?? null,
+                permalinkUrl: detail.data?.permalink_url || null
               };
             } catch (err) {
               // Ignorar errores individuales (403, etc.)
@@ -470,7 +492,24 @@ async function getProjectDetailWithRetry(projectGid, retries = 3) {
   while (true) {
     try {
       return await projectsApi.getProject(projectGid, {
-        opt_fields: 'custom_fields,custom_fields.name,custom_fields.display_value'
+        opt_fields: [
+          'custom_fields',
+          'custom_fields.name',
+          'custom_fields.display_value',
+          'current_status.text',
+          'current_status.title',
+          'current_status.created_at',
+          'completed',
+          'completed_at',
+          'modified_at',
+          'created_at',
+          'due_on',
+          'due_at',
+          'num_tasks',
+          'num_tasks_incomplete',
+          'notes',
+          'permalink_url'
+        ].join(',')
       });
     } catch (error) {
       const status = error?.status || error?.response?.status;

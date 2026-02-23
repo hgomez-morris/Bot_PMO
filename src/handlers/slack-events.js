@@ -168,24 +168,27 @@ async function handleAdvancesText(userId, text) {
     return;
   }
 
-  if (textLower === 'mis proyectos' || textLower === 'proyectos') {
+  if ((textLower === 'mis proyectos' || textLower === 'proyectos') && !textLower.includes('cliente')) {
     const user = await dynamoService.getUser(userId);
     if (user?.asanaName) {
       const projects = await dynamoService.getProjectsByResponsableName(user.asanaName);
       if (projects.length > 0) {
-        const projectList = projects.map(p => `- ${p.name}`).join('\n');
+        const projectList = projects.map((p) => {
+          const statusText = p.status || 'Sin estado';
+          const progress = p.progressPercent || 'N/A';
+          const due = p.dueOn || p.dueAt || 'N/A';
+          const pmoId = p.pmoId || 'PMO-N/A';
+          return `- ${pmoId} | ${p.name} | ${statusText} | ${progress} | ${due}`;
+        }).join('\n');
         await slackService.sendMessage(
           userId,
-          `*Tus proyectos (${projects.length}):*
-${projectList}`
+          `*Tus proyectos (${projects.length}):*\n${projectList}`
         );
       } else {
         await slackService.sendMessage(
           userId,
-          `Aun no tengo proyectos cacheados para tu perfil.
-` +
-          `Tu nombre en Asana: *${user.asanaName}*.
-` +
+          `Aun no tengo proyectos cacheados para tu perfil.\n` +
+          `Tu nombre en Asana: *${user.asanaName}*.\n` +
           `El cache global se actualiza cada 6 horas.`
         );
       }
@@ -195,6 +198,24 @@ ${projectList}`
     return;
   }
 
+
+  const state = await conversationState.getConversationState(userId);
+  if (state && conversationState.isInUpdateFlow(state)) {
+    if (isSnoozeCommand(textLower)) {
+      const snoozeUntil = new Date(Date.now() + 60 * 60 * 1000).toISOString();
+      await conversationState.setConversationState(userId, {
+        ...state,
+        snoozeUntil
+      });
+      await slackService.sendMessage(userId, 'Perfecto, te vuelvo a avisar en 1 hora.');
+      return;
+    }
+  }
+
+  const handledSearch = await handleSearchFlow(userId, text, textLower, state);
+  if (handledSearch) {
+    return;
+  }
 
   // Buscar proyecto por PMO ID (ej: PMO-911)
   const pmoIdMatch = text.match(/pmo-?\d+/i);
@@ -206,11 +227,29 @@ ${projectList}`
     try {
       const project = await dynamoService.getProjectByPmoIdCached(pmoId);
       if (project) {
+        const statusText = project.status || 'Sin estado';
+        const updateText = project.lastUpdateText || 'Sin actualizacion';
+        const updateDate = project.lastUpdateAt
+          ? new Date(project.lastUpdateAt).toLocaleDateString('es-CL')
+          : 'N/A';
+        const progress = project.progressPercent || 'N/A';
+        const due = project.dueOn || project.dueAt || 'N/A';
+        const pending = (project.pendingTasks !== null && project.pendingTasks !== undefined)
+          ? project.pendingTasks
+          : 'N/A';
+        const total = (project.totalTasks !== null && project.totalTasks !== undefined)
+          ? project.totalTasks
+          : 'N/A';
+
         const info = [
           `*${project.name}*`,
           `- PMO ID: ${project.pmoId || pmoId}`,
           `- Responsable: ${project.responsable || 'No asignado'}`,
-          `- Estado: ${project.status || 'Sin estado'}`
+          `- Estado: ${statusText}`,
+          `- Ultima actualizacion (${updateDate}): ${updateText}`,
+          `- Avance: ${progress}`,
+          `- Fecha fin: ${due}`,
+          `- Tareas pendientes: ${pending} / ${total}`
         ].join('\n');
         await slackService.sendMessage(userId, info);
       } else {
@@ -226,14 +265,13 @@ ${projectList}`
     return;
   }
 
-  // Obtener estado de conversación
-  const state = await conversationState.getConversationState(userId);
+  // Obtener estado de conversacion
 
   if (state && state.step === 'awaiting_advances') {
     // Guardar update completo
     await dynamoService.saveUpdate({
-      projectGid: state.projectGid,
-      projectName: state.projectName,
+      projectGid: state.currentProjectGid,
+      projectName: state.currentProjectName,
       pmSlackId: userId,
       status: state.status,
       advances: text,
@@ -242,7 +280,7 @@ ${projectList}`
     });
 
     // Evaluar riesgo
-    const previousUpdates = await dynamoService.getLastUpdates(state.projectGid, 2);
+    const previousUpdates = await dynamoService.getLastUpdates(state.currentProjectGid, 2);
     const riskAnalysis = riskDetector.shouldAlert(
       { status: state.status, hasBlockers: state.hasBlockers },
       previousUpdates
@@ -250,7 +288,7 @@ ${projectList}`
 
     if (riskAnalysis.shouldAlert) {
       await slackService.sendAlertToPMO(
-        state.projectName,
+        state.currentProjectName,
         userId,
         state.status,
         text,
@@ -258,9 +296,12 @@ ${projectList}`
       );
     }
 
-    // Limpiar estado y confirmar
-    await conversationState.clearConversationState(userId);
-    await slackService.sendMessage(userId, `${messages.getStatusEmoji(state.status)} Update registrado para *${state.projectName}*. ¡Gracias!`);
+    await slackService.sendMessage(userId, `${messages.getStatusEmoji(state.status)} Update registrado para *${state.currentProjectName}*. !Gracias!`);
+
+    const advanced = await advanceToNextProject(userId, state);
+    if (!advanced) {
+      await conversationState.clearConversationState(userId);
+    }
     return;
   }
 
@@ -278,7 +319,8 @@ async function handleWithAgent(userId, text) {
 
     // Si el agente devuelve una respuesta directa
     if (result.response) {
-      await slackService.sendMessage(userId, result.response);
+      const cleaned = normalizeAgentResponse(result.response);
+      await slackService.sendMessage(userId, cleaned);
       return;
     }
 
@@ -289,11 +331,29 @@ async function handleWithAgent(userId, text) {
           const pmoId = result.params.pmo_id;
           const project = await dynamoService.getProjectByPmoIdCached(pmoId);
           if (project) {
+            const statusText = project.status || 'Sin estado';
+            const updateText = project.lastUpdateText || 'Sin actualizacion';
+            const updateDate = project.lastUpdateAt
+              ? new Date(project.lastUpdateAt).toLocaleDateString('es-CL')
+              : 'N/A';
+            const progress = project.progressPercent || 'N/A';
+            const due = project.dueOn || project.dueAt || 'N/A';
+            const pending = (project.pendingTasks !== null && project.pendingTasks !== undefined)
+              ? project.pendingTasks
+              : 'N/A';
+            const total = (project.totalTasks !== null && project.totalTasks !== undefined)
+              ? project.totalTasks
+              : 'N/A';
+
             const info = [
               `*${project.name}*`,
               `- PMO ID: ${project.pmoId || pmoId}`,
               `- Responsable: ${project.responsable || 'No asignado'}`,
-              `- Estado: ${project.status || 'Sin estado'}`
+              `- Estado: ${statusText}`,
+              `- Ultima actualizacion (${updateDate}): ${updateText}`,
+              `- Avance: ${progress}`,
+              `- Fecha fin: ${due}`,
+              `- Tareas pendientes: ${pending} / ${total}`
             ].join('\n');
             await slackService.sendMessage(userId, info);
           } else {
@@ -305,9 +365,14 @@ async function handleWithAgent(userId, text) {
           if (user?.asanaName) {
             const projects = await dynamoService.getProjectsByResponsableName(user.asanaName);
             if (projects.length > 0) {
-              const projectList = projects.map(p => `- ${p.name}`).join('\n');
-              await slackService.sendMessage(userId, `*Tus proyectos:*
-${projectList}`);
+              const projectList = projects.map((p) => {
+                const statusText = p.status || 'Sin estado';
+                const progress = p.progressPercent || 'N/A';
+                const due = p.dueOn || p.dueAt || 'N/A';
+                const pmoId = p.pmoId || 'PMO-N/A';
+                return `- ${pmoId} | ${p.name} | ${statusText} | ${progress} | ${due}`;
+              }).join('\n');
+              await slackService.sendMessage(userId, `*Tus proyectos:*\n${projectList}`);
             } else {
               await slackService.sendMessage(
                 userId,
@@ -335,6 +400,229 @@ ${projectList}`);
     console.error('Error en agente:', error);
     await slackService.sendMessage(userId, 'Hubo un error procesando tu mensaje. Intenta de nuevo.');
   }
+
+
+function normalizeAgentResponse(text) {
+  const trimmed = String(text || '').trim();
+  const match = trimmed.match(/<respuesta_directa>\s*({[\s\S]*?})\s*<\/respuesta_directa>/i);
+  if (match) {
+    try {
+      const payload = JSON.parse(match[1]);
+      if (payload && payload.mensaje) {
+        return String(payload.mensaje);
+      }
+    } catch {
+      return trimmed.replace(/<[^>]+>/g, '').trim();
+    }
+  }
+  return trimmed;
+}
+
+function normalizeText(text) {
+  return text.toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '');
+}
+
+
+async function handleSearchFlow(userId, text, textLower, state) {
+  // Preguntas de contexto corto
+  if (isProjectEndDateQuestion(textLower) && state?.lastProjectAt) {
+    const lastAt = new Date(state.lastProjectAt);
+    const diffMs = Date.now() - lastAt.getTime();
+    if (diffMs <= 30 * 60 * 1000) {
+      const due = state.lastProjectDueOn || state.lastProjectDueAt;
+      if (due) {
+        const date = new Date(due).toLocaleDateString('es-CL');
+        await slackService.sendMessage(userId, `La fecha estimada es ${date}.`);
+      } else {
+        await slackService.sendMessage(userId, 'No tengo fecha de termino registrada para ese proyecto.');
+      }
+      return true;
+    }
+  }
+
+  // Paginacion de resultados
+  if (state?.searchResults && isNextPageCommand(textLower)) {
+    const nextPage = (state.searchPage || 0) + 1;
+    const handled = await sendSearchResultsPage(userId, state, nextPage);
+    return handled;
+  }
+
+  // Seleccion de resultado por numero
+  if (state?.searchResults) {
+    const selection = parseSelectionNumber(textLower);
+    if (selection !== null) {
+      const index = (state.searchPage || 0) * 5 + (selection - 1);
+      const project = state.searchResults[index];
+      if (project) {
+        await respondWithProjectDetails(userId, project, state);
+      } else {
+        await slackService.sendMessage(userId, 'Seleccion no valida.');
+      }
+      return true;
+    }
+  }
+
+  const query = extractSearchQuery(text);
+  if (!query) return false;
+
+  const results = await dynamoService.searchProjects(query, 50);
+  if (results.length == 0) {
+    await slackService.sendMessage(userId, 'No encontre proyectos con ese criterio.');
+    return true;
+  }
+
+  await conversationState.setConversationState(userId, {
+    ...state,
+    searchQuery: query,
+    searchResults: results,
+    searchPage: 0,
+    lastSearchAt: new Date().toISOString()
+  });
+
+  await sendSearchResultsPage(userId, { ...state, searchResults: results, searchPage: 0 }, 0);
+  return true;
+}
+
+async function sendSearchResultsPage(userId, state, page) {
+  const results = state.searchResults || [];
+  const pageSize = 5;
+  const start = page * pageSize;
+  const slice = results.slice(start, start + pageSize);
+  if (slice.length == 0) {
+    await slackService.sendMessage(userId, 'No hay mas proyectos para mostrar.');
+    return true;
+  }
+
+  const lines = slice.map((p, i) => {
+    const num = start + i + 1;
+    const pmoId = p.pmoId || 'PMO-N/A';
+    const statusText = p.status || 'Sin estado';
+    return `${num}. ${pmoId} | ${p.name} | ${statusText}`;
+  }).join('\n');
+
+  await slackService.sendMessage(
+    userId,
+    `Estos son los proyectos que encontre:\n${lines}\n\nResponde con el numero para ver detalles o escribe "siguiente" para mas.`
+  );
+
+  await conversationState.setConversationState(userId, {
+    ...state,
+    searchPage: page
+  });
+  return true;
+}
+
+async function respondWithProjectDetails(userId, project, state) {
+  const statusText = project.status || 'Sin estado';
+  const updateText = project.lastUpdateText || 'Sin actualizacion';
+  const updateDate = project.lastUpdateAt
+    ? new Date(project.lastUpdateAt).toLocaleDateString('es-CL')
+    : 'N/A';
+  const progress = project.progressPercent || 'N/A';
+  const due = project.dueOn || project.dueAt || 'N/A';
+  const pending = (project.pendingTasks !== null && project.pendingTasks !== undefined)
+    ? project.pendingTasks
+    : 'N/A';
+  const total = (project.totalTasks !== null && project.totalTasks !== undefined)
+    ? project.totalTasks
+    : 'N/A';
+
+  const info = [
+    `*${project.name}*`,
+    `- PMO ID: ${project.pmoId || 'PMO-N/A'}`,
+    `- Responsable: ${project.responsable || 'No asignado'}`,
+    `- Estado: ${statusText}`,
+    `- Ultima actualizacion (${updateDate}): ${updateText}`,
+    `- Avance: ${progress}`,
+    `- Fecha fin: ${due}`,
+    `- Tareas pendientes: ${pending} / ${total}`
+  ].join('\n');
+
+  await slackService.sendMessage(userId, info);
+  await conversationState.setConversationState(userId, {
+    ...state,
+    lastProjectGid: project.gid,
+    lastProjectName: project.name,
+    lastProjectDueOn: project.dueOn || null,
+    lastProjectDueAt: project.dueAt || null,
+    lastProjectAt: new Date().toISOString()
+  });
+}
+
+function extractSearchQuery(text) {
+  const quoted = text.match(/"([^"]+)"/);
+  if (quoted) {
+    return quoted[1].trim();
+  }
+
+  const lower = normalizeText(text);
+  if (!lower.includes('proyecto') && !lower.includes('cliente')) {
+    return null;
+  }
+
+  let cleaned = lower
+    .replace(/\b(dame|muestrame|mu?estrame|quiero|necesito|ver|mostrar|busca|buscar)\b/g, '')
+    .replace(/\b(el|la|los|las|del|de|con|nombre|llamado|llamada|cliente|proyecto|proyectos)\b/g, '')
+    .replace(/[^a-z0-9\s]/g, ' ')
+    .trim();
+
+  if (cleaned.length < 3) {
+    return null;
+  }
+
+  return cleaned;
+}
+
+function isNextPageCommand(textLower) {
+  const t = normalizeText(textLower);
+  return t == 'siguiente' || t == 'next' || t == 'mas' || t == 'mas proyectos';
+}
+
+function parseSelectionNumber(textLower) {
+  const match = textLower.match(/^(\d{1,2})$/);
+  if (!match) return null;
+  const num = Number(match[1]);
+  if (num < 1 || num > 50) return null;
+  return num;
+}
+
+function isProjectEndDateQuestion(textLower) {
+  return textLower.includes('cuando termina') || textLower.includes('fecha fin') || textLower.includes('termina ese proyecto');
+}
+
+function isSnoozeCommand(text) {
+  const t = normalizeText(text.trim());
+  return t.includes('mas tarde') || t.includes('postergar') || t.includes('despues');
+}
+
+async function advanceToNextProject(userId, state) {
+  const pending = Array.isArray(state.pendingProjects) ? state.pendingProjects : [];
+  const currentIndex = typeof state.currentIndex === 'number' ? state.currentIndex : 0;
+  const nextIndex = currentIndex + 1;
+
+  if (nextIndex >= pending.length) {
+    return false;
+  }
+
+  const next = pending[nextIndex];
+  await conversationState.setConversationState(userId, {
+    ...state,
+    step: 'awaiting_status',
+    currentIndex: nextIndex,
+    currentProjectGid: next.gid,
+    currentProjectName: next.name,
+    currentProjectPmoId: next.pmoId || null,
+    status: null,
+    hasBlockers: null,
+    blockerDescription: null,
+    lastPromptAt: new Date().toISOString(),
+    snoozeUntil: null
+  });
+
+  await slackService.sendUpdateRequest(userId, next.name, next.gid);
+  return true;
+}
+
 }
 
 /**
@@ -355,12 +643,28 @@ async function handleBlockActions(payload) {
   if (actionType === 'status') {
     // status_{projectGid}_{value}
     const projectGid = parts[1];
+    const currentState = await conversationState.getConversationState(userId);
+    let projectName = currentState?.currentProjectName || null;
+    let projectPmoId = currentState?.currentProjectPmoId || null;
+
+    if (currentState?.pendingProjects && currentState.pendingProjects.length > 0) {
+      const match = currentState.pendingProjects.find(p => p.gid === projectGid);
+      if (match) {
+        projectName = match.name;
+        projectPmoId = match.pmoId || projectPmoId;
+      }
+    }
+
     await conversationState.setConversationState(userId, {
       step: 'awaiting_blockers',
-      projectGid,
-      status: value
+      currentProjectGid: projectGid,
+      currentProjectName: projectName,
+      currentProjectPmoId: projectPmoId,
+      status: value,
+      lastPromptAt: new Date().toISOString()
     });
-    // El mensaje de bloqueos ya está en el mensaje original
+    // El mensaje de bloqueos ya esta en el mensaje original
+  } else if (actionType === 'blockers') {
   } else if (actionType === 'blockers') {
     // blockers_{projectGid}_{yes|no}
     const state = await conversationState.getConversationState(userId);
@@ -369,7 +673,8 @@ async function handleBlockActions(payload) {
     await conversationState.setConversationState(userId, {
       ...state,
       step: 'awaiting_advances',
-      hasBlockers
+      hasBlockers,
+      lastPromptAt: new Date().toISOString()
     });
 
     // Pedir descripción de avances

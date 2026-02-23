@@ -259,6 +259,24 @@ async function clearConversationState(slackUserId) {
   }
 }
 
+async function getActiveConversationStates() {
+  try {
+    const response = await docClient.send(new ScanCommand({
+      TableName: CONVERSATIONS_TABLE,
+      FilterExpression: 'step IN (:s1, :s2, :s3)',
+      ExpressionAttributeValues: {
+        ':s1': 'awaiting_status',
+        ':s2': 'awaiting_blockers',
+        ':s3': 'awaiting_advances'
+      }
+    }));
+    return response.Items || [];
+  } catch (error) {
+    console.error('Error obteniendo estados de conversacion activos:', error);
+    return [];
+  }
+}
+
 /**
  * Elimina un usuario
  * @param {string} slackUserId
@@ -348,7 +366,18 @@ async function upsertProjectCache(project) {
     sk: 'META',
     gid: project.gid,
     name: project.name,
+    nameLower: project.name ? project.name.toLowerCase() : null,
     status: project.status || null,
+    clienteNuevo: project.clienteNuevo || null,
+    clienteLower: project.clienteNuevo ? project.clienteNuevo.toLowerCase() : null,
+    lastUpdateText: project.lastUpdateText || null,
+    lastUpdateAt: project.lastUpdateAt || null,
+    progressPercent: project.progressPercent || null,
+    dueOn: project.dueOn || null,
+    dueAt: project.dueAt || null,
+    pendingTasks: project.pendingTasks ?? null,
+    totalTasks: project.totalTasks ?? null,
+    permalinkUrl: project.permalinkUrl || null,
     responsable: project.responsable || null,
     responsableKey: project.responsable ? `RESPONSABLE#${normalizeName(project.responsable)}` : null,
     pmoId: project.pmoId ? project.pmoId.toUpperCase() : null,
@@ -434,6 +463,32 @@ async function getProjectByPmoIdCached(pmoId) {
   }
 }
 
+
+async function searchProjects(query, limit = 50) {
+  const q = (query || '').toLowerCase().trim();
+  if (!q) return [];
+
+  try {
+    const response = await docClient.send(new ScanCommand({
+      TableName: PROJECTS_TABLE,
+      FilterExpression: 'contains(#nameLower, :q) OR contains(#clienteLower, :q)',
+      ExpressionAttributeNames: {
+        '#nameLower': 'nameLower',
+        '#clienteLower': 'clienteLower'
+      },
+      ExpressionAttributeValues: {
+        ':q': q
+      }
+    }));
+
+    const items = response.Items || [];
+    items.sort((a, b) => (a.name || '').localeCompare(b.name || ''));
+    return items.slice(0, limit);
+  } catch (error) {
+    console.error('Error buscando proyectos por texto:', error);
+    return [];
+  }
+}
 module.exports = {
   getUser,
   saveUser,
@@ -446,6 +501,7 @@ module.exports = {
   getConversationState,
   setConversationState,
   clearConversationState,
+  getActiveConversationStates,
   cacheUserProjects,
   getCachedUserProjects,
   upsertProjectCache,

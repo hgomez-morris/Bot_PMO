@@ -251,6 +251,28 @@ Resources:
             Description: Refresh projects cache every 6 hours
             Enabled: true
 
+  ReminderFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub pulse-bot-reminder-${Environment}
+      Handler: src/handlers/reminder.handler
+      CodeUri: ../
+      Timeout: 60
+      MemorySize: 512
+      Description: Sends reminders for pending updates
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ConversationsTable
+        - DynamoDBReadPolicy:
+            TableName: !Ref UpdatesTable
+      Events:
+        HourlyReminder:
+          Type: Schedule
+          Properties:
+            Schedule: rate(15 minutes)
+            Description: Check pending updates and remind after 1 hour
+            Enabled: true
+
   # ----------------------------------------
   # HTTP API (API Gateway v2)
   # ----------------------------------------
@@ -289,6 +311,12 @@ Resources:
       LogGroupName: !Sub /aws/lambda/pulse-bot-cache-refresh-${Environment}
       RetentionInDays: 30
 
+  ReminderLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/pulse-bot-reminder-${Environment}
+      RetentionInDays: 30
+
 # ============================================
 # OUTPUTS
 # ============================================
@@ -314,6 +342,10 @@ Outputs:
   CacheRefreshFunctionArn:
     Description: Cache Refresh Lambda ARN
     Value: !GetAtt CacheRefreshFunction.Arn
+
+  ReminderFunctionArn:
+    Description: Reminder Lambda ARN
+    Value: !GetAtt ReminderFunction.Arn
 
   UsersTableName:
     Description: DynamoDB Users Table Name

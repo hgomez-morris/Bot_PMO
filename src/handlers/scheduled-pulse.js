@@ -10,6 +10,7 @@
 const { DateTime } = require('luxon');
 const dynamoService = require('../services/dynamo');
 const slackService = require('../services/slack');
+const conversationState = require('../lib/conversation-state');
 
 /**
  * Handler principal de Lambda
@@ -50,30 +51,60 @@ exports.handler = async (event) => {
           continue;
         }
 
+        // Si ya hay una conversacion activa, no iniciar otra cola
+        const state = await conversationState.getConversationState(user.slackUserId);
+        if (state && conversationState.isInUpdateFlow(state)) {
+          console.log(`Usuario ${user.slackUserId} ya tiene flujo activo, saltando`);
+          continue;
+        }
+
         // Obtener proyectos del usuario desde cache global
         const projects = await dynamoService.getProjectsByResponsableName(user.asanaName);
 
-        // Limitar a 5 proyectos en MVP
-        const projectsToProcess = projects.slice(0, 5);
-        stats.projectsFound += projectsToProcess.length;
+        // Filtrar completados y los que ya tienen update hoy
+        const filtered = projects.filter((project) => {
+          const status = (project.status || '').toLowerCase();
+          if (status === 'completed') return false;
+          if (updatedTodaySet.has(project.gid)) return false;
+          return true;
+        });
 
-        // Enviar solicitud para cada proyecto que no tenga update hoy
-        for (const project of projectsToProcess) {
-          if (updatedTodaySet.has(project.gid)) {
-            console.log(`Proyecto ${project.gid} ya tiene update hoy, saltando`);
-            continue;
-          }
+        // Ordenar por PMO-ID numerico si existe
+        filtered.sort((a, b) => {
+          const aNum = parsePmoIdNumber(a.pmoId);
+          const bNum = parsePmoIdNumber(b.pmoId);
+          return aNum - bNum;
+        });
 
-          await slackService.sendUpdateRequest(
-            user.slackUserId,
-            project.name,
-            project.gid
-          );
-          stats.requestsSent++;
-
-          // Rate limiting: esperar 1 segundo entre mensajes
-          await sleep(1000);
+        if (filtered.length === 0) {
+          continue;
         }
+
+        stats.projectsFound += filtered.length;
+
+        // Iniciar flujo secuencial con el primer proyecto
+        const firstProject = filtered[0];
+        await conversationState.setConversationState(user.slackUserId, {
+          step: 'awaiting_status',
+          pendingProjects: filtered.map((p) => ({
+            gid: p.gid,
+            name: p.name,
+            pmoId: p.pmoId || null,
+            status: p.status || null
+          })),
+          currentIndex: 0,
+          currentProjectGid: firstProject.gid,
+          currentProjectName: firstProject.name,
+          currentProjectPmoId: firstProject.pmoId || null,
+          lastPromptAt: new Date().toISOString()
+        });
+
+        await slackService.sendUpdateRequest(
+          user.slackUserId,
+          firstProject.name,
+          firstProject.gid
+        );
+        stats.requestsSent++;
 
       } catch (userError) {
         console.error(`Error procesando usuario ${user.slackUserId}:`, userError);
@@ -119,4 +150,11 @@ function isAppropriateTime(timezone) {
  */
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function parsePmoIdNumber(pmoId) {
+  if (!pmoId) return Number.POSITIVE_INFINITY;
+  const match = String(pmoId).match(/\d+/);
+  if (!match) return Number.POSITIVE_INFINITY;
+  return Number(match[0]);
 }
